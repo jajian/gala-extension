@@ -12,9 +12,13 @@ Usage:
     # Statistical only (no API key needed):
     python main.py --method gala --dataset re2-ob
 
-    # With LLM agentic reasoning:
+    # With OpenAI agentic reasoning:
     export OPENAI_API_KEY="sk-..."
     python main.py --method gala --dataset re2-ob
+
+    # With Gemini agentic reasoning:
+    export GEMINI_API_KEY="your-gemini-key"
+    python main.py --method gala --dataset re2-ob --model gemini-2.5-flash
 
 Extra requirements:
     pip install openai
@@ -27,6 +31,7 @@ import logging
 import time as time_mod
 from collections import defaultdict
 from pathlib import Path
+from urllib import error, request
 
 import numpy as np
 import pandas as pd
@@ -44,6 +49,61 @@ log = logging.getLogger("GALA")
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_local_env():
+    """Load a nearby .env file without overriding existing environment variables."""
+    candidates = []
+    seen = set()
+    for base in [Path.cwd(), Path(__file__).resolve().parent]:
+        for parent in [base, *base.parents]:
+            env_path = parent / ".env"
+            if env_path in seen:
+                continue
+            seen.add(env_path)
+            candidates.append(env_path)
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+            return env_path
+        except Exception as e:
+            log.warning(f"Failed to load .env from {env_path}: {e}")
+            return None
+    return None
+
+
+_load_local_env()
+
+
+def _default_model():
+    """Choose a sensible default model from the available credentials."""
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return "gemini-2.5-flash"
+    return "gpt-4.1-mini"
+
+
+def _resolve_case_dir(dataset, kwargs):
+    """Locate the current case directory so logs.csv and traces.csv can be loaded."""
+    run_args = kwargs.get("args")
+    data_path = getattr(run_args, "data_path", None) if run_args else None
+    if data_path:
+        return str(Path(data_path).resolve().parent)
+
+    if dataset and Path(str(dataset)).exists():
+        return str(Path(dataset).resolve())
+
+    return dataset
+
 
 def _parse_service_metric(col: str):
     """'cartservice_cpu' -> ('cartservice', 'cpu')"""
@@ -364,11 +424,67 @@ def _build_diagnostic_bundle(candidate, data, logs, spans):
 # PHASE III: LLM Agentic Reasoning & Re-ranking
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _llm_chat(messages, model="gpt-4.1-mini", temperature=1.0, max_tokens=4096):
-    """Call OpenAI chat completions. Returns raw string."""
+def _llm_chat(messages, model="gemini-2.5-flash-lite", temperature=1.0, max_tokens=4096):
+    """Call either Gemini or OpenAI chat completions. Returns raw string."""
+    if model.startswith("gemini"):
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            log.warning("Gemini model requested but GEMINI_API_KEY/GOOGLE_API_KEY is not set.")
+            return ""
+        log.info(f"Using Gemini model: {model}")
+
+        system_parts = []
+        contents = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            text = msg.get("content", "")
+            if not text:
+                continue
+            if role == "system":
+                system_parts.append({"text": text})
+                continue
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": text}]})
+
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        if system_parts:
+            payload["system_instruction"] = {"parts": system_parts}
+
+        req = request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            candidates = body.get("candidates", [])
+            if not candidates:
+                return ""
+            parts = candidates[0].get("content", {}).get("parts", [])
+            return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+        except error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="ignore")
+            log.warning(f"Gemini call failed: HTTP {e.code} {detail[:500]}")
+            return ""
+        except Exception as e:
+            log.warning(f"Gemini call failed: {e}")
+            return ""
+
     try:
         from openai import OpenAI
         client = OpenAI()
+        log.info(f"Using OpenAI model: {model}")
         resp = client.chat.completions.create(
             model=model, messages=messages,
             temperature=temperature, max_tokens=max_tokens,
@@ -380,6 +496,12 @@ def _llm_chat(messages, model="gpt-4.1-mini", temperature=1.0, max_tokens=4096):
     except Exception as e:
         log.warning(f"LLM call failed: {e}")
         return ""
+
+
+def _has_llm_credentials(model):
+    if model.startswith("gemini"):
+        return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    return bool(os.environ.get("OPENAI_API_KEY"))
 
 
 def _parse_json(raw):
@@ -490,14 +612,15 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
 
     kwargs
     ------
-    model    : str  – OpenAI model name  (default: "gpt-4.1-mini")
+    model    : str  – LLM model name; use "gemini-*" for Gemini (default: auto-detect)
     max_iter : int  – max agentic iterations (default: 6)
     use_llm  : bool – set False to skip LLM   (default: True)
     dk_select_useful : bool – passed to preprocess (default: False)
     """
-    model = kwargs.get("model", "gpt-4.1-mini")
+    model = kwargs.get("model") or _default_model()
     max_iter = kwargs.get("max_iter", 6)
     use_llm = kwargs.get("use_llm", True)
+    case_dir = _resolve_case_dir(dataset, kwargs)
 
     # ── Preprocess using RCAEval's standard pipeline ──
     data = preprocess(
@@ -518,7 +641,7 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
         granger_ranked = [x[0] for x in pr]
 
     # ── Phase I-B: TWIST on traces ──
-    spans = _read_traces(dataset)
+    spans = _read_traces(case_dir)
     twist_ranked = _twist_rank(spans, node_names)
 
     # ── Merge via Reciprocal Rank Fusion ──
@@ -532,8 +655,8 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
     merged = merged + rest
 
     # ── Phase III: Agentic Re-ranking (optional) ──
-    logs = _read_logs(dataset)
-    if use_llm and os.environ.get("OPENAI_API_KEY"):
+    logs = _read_logs(case_dir)
+    if use_llm and _has_llm_credentials(model):
         try:
             merged = _agentic_rerank(
                 merged, data, logs, spans,
@@ -541,6 +664,8 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
             )
         except Exception as e:
             log.warning(f"LLM agentic loop failed ({e}); using statistical ranking.")
+    elif use_llm:
+        log.warning(f"Skipping LLM rerank: no credentials available for model '{model}'.")
 
     return {
         "adj": adj,
