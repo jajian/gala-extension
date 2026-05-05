@@ -39,11 +39,36 @@ import networkx as nx
 
 # ── RCAEval internals ─────────────────────────────────────────────────────────
 from RCAEval.graph_construction.granger import granger
-from RCAEval.graph_heads.page_rank import page_rank
+from RCAEval.graph_heads.page_rank import page_rank, page_rank_preprocess
 from RCAEval.io.time_series import preprocess
 from RCAEval.e2e import rca
+from RCAEval.e2e.baro import baro as baro_ranker
 
 log = logging.getLogger("GALA")
+
+# ── Ensure GALA logger outputs if no handlers configured ──
+if not log.handlers:
+    import sys
+    # Stream handler (stderr)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("[GALA] %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+    
+    # File handler (for complete output unaffected by progress bars)
+    try:
+        log_file = Path.cwd() / "gala_debug.log"
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+        file_handler.setFormatter(file_formatter)
+        log.addHandler(file_handler)
+        print(f"[GALA] Logging to file: {log_file}", file=sys.stderr, flush=True)
+    except Exception as e:
+        pass  # Silently skip file logging if it fails
+        
+log.setLevel(logging.DEBUG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +91,8 @@ def _load_local_env():
         if not env_path.exists():
             continue
         try:
+            log.debug(f"Loading .env from {env_path}")
+            loaded_keys = []
             for line in env_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -75,6 +102,9 @@ def _load_local_env():
                 value = value.strip().strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = value
+                    loaded_keys.append(key)
+            if loaded_keys:
+                log.info(f"Loaded {len(loaded_keys)} env vars from {env_path}: {', '.join(loaded_keys)}")
             return env_path
         except Exception as e:
             log.warning(f"Failed to load .env from {env_path}: {e}")
@@ -83,6 +113,17 @@ def _load_local_env():
 
 
 _load_local_env()
+log.debug("[GALA] Module initialized and .env loaded")
+
+
+def _log_flush(level_name="INFO"):
+    """Flush all handlers to ensure output is not buffered."""
+    for handler in log.handlers:
+        if hasattr(handler, "flush"):
+            try:
+                handler.flush()
+            except Exception:
+                pass
 
 
 def _default_model():
@@ -122,10 +163,15 @@ def _fuzzy_svc_match(a: str, b: str) -> bool:
 # DATA LOADING — logs.csv and traces.csv from dataset directory
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_col_name(col):
+    return str(col).lower().replace("_", "")
+
+
 def _find_col(df_columns, candidates):
-    """Find the first column in df_columns whose lowercase matches a candidate."""
+    """Find the first column whose normalized name matches a candidate."""
+    normalized_candidates = {_normalize_col_name(c) for c in candidates}
     for c in df_columns:
-        if c.lower() in candidates:
+        if _normalize_col_name(c) in normalized_candidates:
             return c
     return None
 
@@ -174,10 +220,11 @@ def _read_traces(dataset_dir):
 
     sid_col = None
     for c in df.columns:
-        if "span_id" in c.lower() and "parent" not in c.lower():
+        normalized = _normalize_col_name(c)
+        if "spanid" in normalized and "parent" not in normalized:
             sid_col = c
             break
-    tid_col = _find_col(df.columns, {"trace_id"})
+    tid_col = _find_col(df.columns, {"trace_id", "traceid"})
     pid_col = None
     for c in df.columns:
         if "parent" in c.lower():
@@ -194,7 +241,12 @@ def _read_traces(dataset_dir):
         if "duration" in c.lower():
             dur_col = c
             break
-    ts_col = _find_col(df.columns, {"timestamp", "time", "start_time"})
+    ts_col = _find_col(
+        df.columns,
+        {"timestamp", "start_time", "starttime", "start_time_millis", "starttimemillis"},
+    )
+    if ts_col is None:
+        ts_col = _find_col(df.columns, {"time"})
     sc_col = None
     for c in df.columns:
         if "status" in c.lower():
@@ -204,6 +256,12 @@ def _read_traces(dataset_dir):
     if sid_col is None or tid_col is None:
         return []
 
+    def _as_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     spans = []
     for _, row in df.iterrows():
         spans.append({
@@ -212,16 +270,29 @@ def _read_traces(dataset_dir):
             "parent_span_id": str(row.get(pid_col, "")) if pid_col else "",
             "service": str(row.get(svc_col, "")) if svc_col else "",
             "operation": str(row.get(op_col, "")) if op_col else "",
-            "duration": float(row.get(dur_col, 0)) if dur_col else 0.0,
-            "timestamp": float(row.get(ts_col, 0)) if ts_col else 0.0,
+            "duration": _as_float(row.get(dur_col, 0)) if dur_col else 0.0,
+            "timestamp": _as_float(row.get(ts_col, 0)) if ts_col else 0.0,
             "status_code": str(row.get(sc_col, "0")) if sc_col else "0",
         })
     return spans
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE I-A: Metrics-based ranking (reuses RCAEval's granger + page_rank)
+# PHASE I-A: Metrics-based ranking (BARO by default; Granger+PageRank retained)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _baro_rank(raw_data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwargs) -> list[str]:
+    """Run BARO and return its metric ranking."""
+    result = baro_ranker(
+        raw_data,
+        inject_time=inject_time,
+        dataset=dataset,
+        sli=sli,
+        anomalies=anomalies,
+        **kwargs,
+    )
+    return list(result.get("ranks", []))
+
 
 def _granger_pr_rank(data: pd.DataFrame) -> list[str]:
     """
@@ -235,9 +306,23 @@ def _granger_pr_rank(data: pd.DataFrame) -> list[str]:
     if adj.sum().sum() == 0:
         return node_names
 
-    ranks = page_rank(adj, node_names=node_names)
-    ranks = sorted(ranks, key=lambda x: x[1], reverse=True)
+    ranks = _page_rank_with_fallback(adj, node_names)
     return [x[0] for x in ranks]
+
+
+def _page_rank_with_fallback(adj, node_names):
+    """Run RCAEval PageRank, falling back when the installed sknetwork API differs."""
+    try:
+        ranks = page_rank(adj, node_names=node_names)
+        return sorted(ranks, key=lambda x: x[1], reverse=True)
+    except Exception:
+        log.exception("[GALA] RCAEval page_rank failed; using NetworkX PageRank fallback.")
+
+    pr_input = page_rank_preprocess(adj)
+    graph = nx.from_numpy_array(pr_input, create_using=nx.DiGraph)
+    scores = nx.pagerank(graph) if graph.number_of_edges() else {i: 0.0 for i in range(len(node_names))}
+    ranks = [(node_names[i], scores.get(i, 0.0)) for i in range(len(node_names))]
+    return sorted(ranks, key=lambda x: x[1], reverse=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,7 +359,8 @@ def _twist_rank(spans, metric_cols, w=(0.3, 0.3, 0.2, 0.2), z_thresh=2.0):
 
     # Also flag non-OK status codes
     for s in spans:
-        if str(s.get("status_code", "0")) not in ("0", "OK", "200", ""):
+        status_code = str(s.get("status_code", "0")).strip().upper()
+        if status_code not in ("0", "0.0", "OK", "200", "200.0", ""):
             anom_span_ids.add(s["span_id"])
 
     # ── Group spans by trace and find anomalous traces ──
@@ -456,9 +542,13 @@ def _llm_chat(messages, model="gemini-2.5-flash-lite", temperature=1.0, max_toke
         if system_parts:
             payload["system_instruction"] = {"parts": system_parts}
 
+        payload_json = json.dumps(payload)
+        log.info(f"[Gemini Request] URL: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent")
+        log.info(f"[Gemini Request] Payload ({len(payload_json)} bytes):\n{payload_json[:2000]}{'...(truncated)' if len(payload_json) > 2000 else ''}")
+
         req = request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            data=json.dumps(payload).encode("utf-8"),
+            data=payload_json.encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "x-goog-api-key": api_key,
@@ -467,12 +557,17 @@ def _llm_chat(messages, model="gemini-2.5-flash-lite", temperature=1.0, max_toke
         )
         try:
             with request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                response_data = resp.read().decode("utf-8")
+                body = json.loads(response_data)
+            log.info(f"[Gemini Response] Status: {resp.status}\n{response_data[:2000]}{'...(truncated)' if len(response_data) > 2000 else ''}")
             candidates = body.get("candidates", [])
             if not candidates:
+                log.warning("[Gemini Response] No candidates in response")
                 return ""
             parts = candidates[0].get("content", {}).get("parts", [])
-            return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            result = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            log.info(f"[Gemini Response] Extracted text ({len(result)} chars):\n{result[:1000]}{'...(truncated)' if len(result) > 1000 else ''}")
+            return result
         except error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="ignore")
             log.warning(f"Gemini call failed: HTTP {e.code} {detail[:500]}")
@@ -485,11 +580,16 @@ def _llm_chat(messages, model="gemini-2.5-flash-lite", temperature=1.0, max_toke
         from openai import OpenAI
         client = OpenAI()
         log.info(f"Using OpenAI model: {model}")
+        messages_json = json.dumps(messages)
+        log.info(f"[OpenAI Request] Model: {model}")
+        log.info(f"[OpenAI Request] Payload ({len(messages_json)} bytes):\n{messages_json[:2000]}{'...(truncated)' if len(messages_json) > 2000 else ''}")
         resp = client.chat.completions.create(
             model=model, messages=messages,
             temperature=temperature, max_tokens=max_tokens,
         )
-        return resp.choices[0].message.content
+        response_text = resp.choices[0].message.content
+        log.info(f"[OpenAI Response] ({len(response_text)} chars):\n{response_text[:1000]}{'...(truncated)' if len(response_text) > 1000 else ''}")
+        return response_text
     except ImportError:
         log.warning("openai package not installed — skipping LLM call.")
         return ""
@@ -500,8 +600,12 @@ def _llm_chat(messages, model="gemini-2.5-flash-lite", temperature=1.0, max_toke
 
 def _has_llm_credentials(model):
     if model.startswith("gemini"):
-        return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-    return bool(os.environ.get("OPENAI_API_KEY"))
+        has_creds = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+        log.debug(f"Checking Gemini credentials: GEMINI_API_KEY={bool(os.environ.get('GEMINI_API_KEY'))}, GOOGLE_API_KEY={bool(os.environ.get('GOOGLE_API_KEY'))} → {has_creds}")
+        return has_creds
+    has_creds = bool(os.environ.get("OPENAI_API_KEY"))
+    log.debug(f"Checking OpenAI credentials: OPENAI_API_KEY={has_creds} → {has_creds}")
+    return has_creds
 
 
 def _parse_json(raw):
@@ -604,7 +708,7 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
     """
     GALA: Graph-Augmented LLM Agentic Workflow for RCA.
 
-    Phase I-A : Granger causality + PageRank  (from RCAEval internals)
+    Phase I-A : BARO metrics ranking
     Phase I-B : TWIST trace-based scoring
     Phase I   : Reciprocal Rank Fusion of I-A and I-B
     Phase II  : Pod-centric diagnostic synthesis
@@ -622,6 +726,12 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
     use_llm = kwargs.get("use_llm", True)
     case_dir = _resolve_case_dir(dataset, kwargs)
 
+    log.info(f"[GALA] Starting with model='{model}', use_llm={use_llm}, max_iter={max_iter}")
+    log.info(f"[GALA] Case directory: {case_dir}")
+    _log_flush()
+
+    raw_data = data
+
     # ── Preprocess using RCAEval's standard pipeline ──
     data = preprocess(
         data=data,
@@ -629,23 +739,66 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
         dk_select_useful=kwargs.get("dk_select_useful", False),
     )
     node_names = data.columns.to_list()
+    log.debug(f"[GALA] Preprocessed data has {len(node_names)} metrics: {node_names[:10]}{'...' if len(node_names) > 10 else ''}")
+    _log_flush()
 
-    # ── Phase I-A: Granger + PageRank (reusing RCAEval internals) ──
-    adj = granger(data)
+    # ── Phase I-A: BARO metric ranking ──
+    log.info("[GALA] Phase I-A: Running BARO metric ranking...")
+    _log_flush()
+    try:
+        baro_ranked = _baro_rank(
+            raw_data,
+            inject_time=inject_time,
+            dataset=dataset,
+            sli=sli,
+            anomalies=anomalies,
+            **kwargs,
+        )
+        baro_ranked = [metric for metric in baro_ranked if metric in node_names]
+        if not baro_ranked:
+            baro_ranked = node_names
+            log.debug("[GALA] Phase I-A: BARO returned no overlapping metrics, using all metrics")
+        log.info(f"[GALA] Phase I-A complete. Top 5 from BARO: {baro_ranked[:5]}")
+    except Exception:
+        log.exception("[GALA] Phase I-A BARO failed; falling back to the preprocessed metric order.")
+        baro_ranked = node_names
+    _log_flush()
 
-    if adj.sum().sum() == 0:
-        granger_ranked = node_names
-    else:
-        pr = page_rank(adj, node_names=node_names)
-        pr = sorted(pr, key=lambda x: x[1], reverse=True)
-        granger_ranked = [x[0] for x in pr]
+    # Previous Phase I-A implementation: Granger + PageRank.
+    # Kept here so it can be restored later if needed.
+    #
+    # log.info("[GALA] Phase I-A: Running Granger causality + PageRank...")
+    # _log_flush()
+    # try:
+    #     adj = granger(data)
+    #
+    #     if adj.sum().sum() == 0:
+    #         granger_ranked = node_names
+    #         log.debug("[GALA] Phase I-A: No causal edges found, using all metrics")
+    #     else:
+    #         pr = _page_rank_with_fallback(adj, node_names)
+    #         granger_ranked = [x[0] for x in pr]
+    #     log.info(f"[GALA] Phase I-A complete. Top 5 from Granger+PageRank: {granger_ranked[:5]}")
+    # except Exception:
+    #     log.exception("[GALA] Phase I-A failed; falling back to the preprocessed metric order.")
+    #     adj = np.zeros((len(node_names), len(node_names)))
+    #     granger_ranked = node_names
+    # _log_flush()
 
     # ── Phase I-B: TWIST on traces ──
+    log.info("[GALA] Phase I-B: Running TWIST trace scoring...")
+    _log_flush()
     spans = _read_traces(case_dir)
+    log.debug(f"[GALA] Phase I-B: Loaded {len(spans)} span records from traces")
     twist_ranked = _twist_rank(spans, node_names)
+    if twist_ranked:
+        log.info(f"[GALA] Phase I-B complete. Top 5 from TWIST: {twist_ranked[:5]}")
+    else:
+        log.info("[GALA] Phase I-B: No trace-based ranking (no spans or traces)")
+    _log_flush()
 
     # ── Merge via Reciprocal Rank Fusion ──
-    lists_to_fuse = [granger_ranked]
+    lists_to_fuse = [baro_ranked]
     if twist_ranked:
         lists_to_fuse.append(twist_ranked)
     merged = _rrf(lists_to_fuse)
@@ -653,19 +806,30 @@ def gala(data, inject_time=None, dataset=None, sli=None, anomalies=None, **kwarg
     # Ensure every node_name is present in the ranking
     rest = [c for c in node_names if c not in merged]
     merged = merged + rest
+    log.info(f"[GALA] Phase I (statistical): Top 5 candidates: {merged[:5]}")
+    _log_flush()
 
     # ── Phase III: Agentic Re-ranking (optional) ──
     logs = _read_logs(case_dir)
     if use_llm and _has_llm_credentials(model):
+        log.info(f"[GALA] Phase III: Starting agentic re-ranking with model '{model}' (max {max_iter} iterations)")
+        _log_flush()
         try:
             merged = _agentic_rerank(
                 merged, data, logs, spans,
                 model=model, max_iter=max_iter,
             )
+            log.info(f"[GALA] Phase III complete. Final top 5: {merged[:5]}")
+            _log_flush()
         except Exception as e:
-            log.warning(f"LLM agentic loop failed ({e}); using statistical ranking.")
+            log.warning(f"[GALA] LLM agentic loop failed ({e}); using statistical ranking.")
+            _log_flush()
     elif use_llm:
-        log.warning(f"Skipping LLM rerank: no credentials available for model '{model}'.")
+        log.warning(f"[GALA] Skipping Phase III: no credentials available for model '{model}'.")
+        _log_flush()
+    else:
+        log.info("[GALA] Phase III skipped (use_llm=False)")
+        _log_flush()
 
     return {
         "adj": adj,
